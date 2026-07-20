@@ -67,7 +67,7 @@ repos:
           - resolvelib
           - rich
           - auditwheel_emscripten
-          - pyodide-lock==0.1.0a5
+          - pyodide-lock @ git+https://github.com/hoodmane/pyodide-lock.git@attrs-cattrs
           - virtualenv
           - sphinx
 
