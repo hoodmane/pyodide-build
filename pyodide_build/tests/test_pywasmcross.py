@@ -1,10 +1,17 @@
+import hashlib
+import json
+import os
+import shutil
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
 from pyodide_build.pywasmcross import (
     CrossCompileArgs,
     ExitCodeWithReason,
+    _lines_to_ranges,
     calculate_exports,
     filter_objects,
     get_cmake_compiler_flags,
@@ -306,3 +313,102 @@ def test_fopenmp_simd_is_kept(build_args):
     """-fopenmp-simd does not define _OPENMP and does not imply threads."""
     res = generate_args("cc -c -fopenmp-simd test.c", build_args)
     assert "-fopenmp-simd" in res
+
+
+def test_lines_to_ranges():
+    assert _lines_to_ranges([]) == []
+    assert _lines_to_ranges([5, 1, 2, 3, 9, 10, 10]) == [[1, 3], [5, 5], [9, 10]]
+
+
+@pytest.fixture
+def wrapper_env(tmp_path):
+    """
+    A fake compiler-wrapper setup: a copy of pywasmcross.py with `cc`/`ar`
+    symlinks, fake `emcc`/`emar` scripts, and the env vars the wrapper expects.
+    """
+    import pyodide_build.pywasmcross as pywasmcross_module
+
+    symlink_dir = tmp_path / "symlinks"
+    symlink_dir.mkdir()
+    wrapper = symlink_dir / "pywasmcross.py"
+    shutil.copy2(pywasmcross_module.__file__, wrapper)
+    wrapper.chmod(0o755)
+    for name in ("cc", "ar"):
+        (symlink_dir / name).symlink_to(wrapper)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for tool in ("emcc", "emar"):
+        exe = fake_bin / tool
+        exe.write_text("#!/bin/sh\nexit 0\n")
+        exe.chmod(0o755)
+
+    # The shebang is `#!/usr/bin/env python3`; make sure it resolves to the
+    # test interpreter (which has `coverage` installed).
+    path = f"{Path(sys.executable).parent}{os.pathsep}{fake_bin}{os.pathsep}{os.environ['PATH']}"
+    args = {
+        "pkgname": "testpkg",
+        "cflags": "",
+        "cxxflags": "",
+        "ldflags": "",
+        "target_install_dir": "",
+        "pythoninclude": "",
+        "exports": "pyinit",
+        "abi": "2026_0",
+        "PYTHONPATH": sys.path,
+        "PATH": path,
+        "orig__name__": "pyodide_build.pywasmcross",
+    }
+    env = {
+        "PATH": path,
+        "PYWASMCROSS_ARGS": json.dumps(args),
+        "BUILD_ENV_SCRIPTS_DIR": str(fake_bin),
+    }
+    return symlink_dir, env
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only symlink wrappers")
+def test_coverage_disabled_by_default(wrapper_env, tmp_path):
+    symlink_dir, env = wrapper_env
+    subprocess.run([symlink_dir / "cc", "-c", "foo.c"], env=env, check=True)
+    assert not list(tmp_path.rglob("*.jsonl"))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only symlink wrappers")
+def test_coverage_records(wrapper_env, tmp_path):
+    pytest.importorskip("coverage")
+    symlink_dir, env = wrapper_env
+    cov_dir = tmp_path / "cov" / "nested"
+    env["PYWASMCROSS_COVERAGE_DIR"] = str(cov_dir)
+
+    subprocess.run([symlink_dir / "cc", "-c", "foo.c"], env=env, check=True)
+    subprocess.run([symlink_dir / "ar", "rcs", "x.a", "foo.o"], env=env, check=True)
+    # Nonzero exit from the wrapper must still produce a record.
+    res = subprocess.run(
+        [symlink_dir / "cc", "-fopenmp", "-c", "foo.c"], env=env, check=False
+    )
+    assert res.returncode == 1
+
+    record_file = cov_dir / "testpkg.jsonl"
+    records = [json.loads(line) for line in record_file.read_text().splitlines()]
+    assert [r["cmd"] for r in records] == ["cc", "ar", "cc"]
+
+    source_lines = (symlink_dir / "pywasmcross.py").read_text().splitlines()
+
+    def lineno(snippet: str) -> int:
+        (idx,) = [i for i, line in enumerate(source_lines, 1) if snippet in line]
+        return idx
+
+    def executed(record) -> set[int]:
+        return {n for start, end in record["lines"] for n in range(start, end + 1)}
+
+    emar_line = lineno('line[0] = "emar"')
+    openmp_line = lineno("openmp requires threads and is not supported")
+    cc_lines, ar_lines, openmp_lines = map(executed, records)
+    assert emar_line not in cc_lines
+    assert emar_line in ar_lines
+    assert openmp_line not in cc_lines
+    assert openmp_line in openmp_lines
+
+    digest = hashlib.sha256((symlink_dir / "pywasmcross.py").read_bytes()).hexdigest()
+    assert all(r["src"] == digest[:16] for r in records)

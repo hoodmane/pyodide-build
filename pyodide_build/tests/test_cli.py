@@ -179,6 +179,92 @@ def test_build_recipe_plain(tmp_path, dummy_xbuildenv, mock_emscripten):
     assert len(built_wheels) == len(pkgs_to_build)
 
 
+@pytest.mark.parametrize(
+    "extra_args, expected_subdir",
+    [
+        (["--coverage"], build_recipes.DEFAULT_COVERAGE_DIR),
+        (["--coverage", "--coverage-dir", "cov"], "cov"),
+        # --coverage-dir implies --coverage
+        (["--coverage-dir", "cov"], "cov"),
+    ],
+)
+def test_build_recipe_coverage_flag(
+    tmp_path, dummy_xbuildenv, mock_emscripten, monkeypatch, extra_args, expected_subdir
+):
+    pytest.importorskip("coverage")
+    import os
+
+    seen: dict[str, str | None] = {}
+
+    def fake_impl(*args, **kwargs):
+        seen["env"] = os.environ.get("PYWASMCROSS_COVERAGE_DIR")
+
+    monkeypatch.setattr(build_recipes, "build_recipes_impl", fake_impl)
+    monkeypatch.delenv("PYWASMCROSS_COVERAGE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        build_recipes.build_recipes,
+        ["pkg_test_graph3", "--recipe-dir", str(RECIPE_DIR), *extra_args],
+    )
+    assert_runner_succeeded(result)
+
+    # The wrapper runs with the package source dir as cwd, so the path
+    # handed down through the environment must be absolute.
+    expected = (tmp_path / expected_subdir).resolve()
+    assert seen["env"] == str(expected)
+    assert expected.is_dir()
+    assert "Recording pywasmcross coverage" in result.output
+
+
+def test_build_recipe_coverage_flag_off_by_default(
+    tmp_path, dummy_xbuildenv, mock_emscripten, monkeypatch
+):
+    import os
+
+    seen: dict[str, str | None] = {}
+
+    def fake_impl(*args, **kwargs):
+        seen["env"] = os.environ.get("PYWASMCROSS_COVERAGE_DIR")
+
+    monkeypatch.setattr(build_recipes, "build_recipes_impl", fake_impl)
+    monkeypatch.delenv("PYWASMCROSS_COVERAGE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        build_recipes.build_recipes,
+        ["pkg_test_graph3", "--recipe-dir", str(RECIPE_DIR)],
+    )
+    assert_runner_succeeded(result)
+    assert seen["env"] is None
+    assert not (tmp_path / build_recipes.DEFAULT_COVERAGE_DIR).exists()
+
+
+def test_build_recipe_coverage_requires_coverage_package(
+    tmp_path, dummy_xbuildenv, monkeypatch
+):
+    import importlib.util
+
+    real_find_spec = importlib.util.find_spec
+
+    def fake_find_spec(name, *args, **kwargs):
+        if name == "coverage":
+            return None
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+    monkeypatch.delenv("PYWASMCROSS_COVERAGE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        build_recipes.build_recipes_no_deps,
+        ["pkg_test_graph3", "--recipe-dir", str(RECIPE_DIR), "--coverage"],
+    )
+    assert result.exit_code == 1
+    assert "requires the 'coverage' package" in result.output
+    assert not (tmp_path / build_recipes.DEFAULT_COVERAGE_DIR).exists()
+
+
 def test_build_recipe_clean(tmp_path, dummy_xbuildenv, mock_emscripten):
     output_dir = tmp_path / "dist"
 

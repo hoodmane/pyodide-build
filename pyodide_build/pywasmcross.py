@@ -14,7 +14,7 @@ import sys
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from __main__ import __file__ as INVOKED_PATH_STR
 
@@ -678,6 +678,102 @@ def handle_command(
     return result.returncode
 
 
+def _lines_to_ranges(lines: Iterable[int]) -> list[list[int]]:  # pragma: no cover
+    """
+    Compress a set of line numbers into a sorted list of inclusive
+    ``[start, end]`` ranges.
+
+    >>> _lines_to_ranges([5, 1, 2, 3, 9, 10])
+    [[1, 3], [5, 5], [9, 10]]
+    """
+    ranges: list[list[int]] = []
+    for line in sorted(set(lines)):
+        if ranges and ranges[-1][1] == line - 1:
+            ranges[-1][1] = line
+        else:
+            ranges.append([line, line])
+    return ranges
+
+
+def _coverage_start() -> Any | None:  # pragma: no cover
+    """
+    If ``PYWASMCROSS_COVERAGE_DIR`` is set, start measuring line coverage of
+    this file for the current compiler invocation.
+
+    This is a development aid for figuring out which lines of pywasmcross are
+    exercised by which package builds. See ``_coverage_save`` for the output
+    format. Returns the ``coverage.Coverage`` object, or ``None`` if disabled.
+    """
+    if not os.environ.get("PYWASMCROSS_COVERAGE_DIR"):
+        return None
+    try:
+        import coverage
+    except ImportError:
+        raise RuntimeError(
+            "PYWASMCROSS_COVERAGE_DIR is set but the 'coverage' package is not "
+            "importable from the pyodide-build environment. Install it with "
+            "`pip install coverage`."
+        ) from None
+
+    # config_file=False: the cwd is the package source tree, which may contain
+    # its own coverage configuration that we must not pick up.
+    # data_file=None: keep data in memory, we write our own compact record.
+    cov = coverage.Coverage(
+        data_file=None,
+        config_file=False,
+        include=[str(INVOKED_PATH.resolve())],
+        branch=False,
+    )
+    cov.start()
+    return cov
+
+
+def _coverage_save(cov: Any) -> None:  # pragma: no cover
+    """
+    Stop measuring and append a record for this invocation to
+    ``$PYWASMCROSS_COVERAGE_DIR/<pkgname>.jsonl``.
+
+    Each record is a single JSON object on one line::
+
+        {"cmd": "cc", "src": "<sha256 prefix of this file>", "lines": [[start, end], ...]}
+
+    We use one small append per process rather than coverage's native data
+    files because a single package build can invoke this wrapper thousands of
+    times, and each native data file is ~50KB. A single ``O_APPEND`` write of a
+    few hundred bytes is atomic on local filesystems, so concurrent compiler
+    invocations can safely share one file per package.
+
+    Note that coverage does not trace the frame in which it was started, so
+    module-level statements (imports, ``def`` lines, the ``if
+    IS_COMPILER_INVOCATION`` preamble) never appear in these records; only
+    lines inside function bodies do.
+    """
+    from hashlib import sha256
+
+    cov.stop()
+    data = cov.get_data()
+    lines: set[int] = set()
+    for filename in data.measured_files():
+        lines.update(data.lines(filename) or ())
+
+    pkgname = PYWASMCROSS_ARGS.get("pkgname") or "_unnamed"
+    out_dir = Path(os.environ["PYWASMCROSS_COVERAGE_DIR"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    record = {
+        "cmd": Path(sys.argv[0]).name,
+        "src": sha256(INVOKED_PATH.resolve().read_bytes()).hexdigest()[:16],
+        "lines": _lines_to_ranges(lines),
+    }
+    payload = (json.dumps(record, separators=(",", ":")) + "\n").encode()
+    fd = os.open(
+        out_dir / f"{pkgname}.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644
+    )
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+
+
 def compiler_main():
     build_args = CrossCompileArgs(
         pkgname=PYWASMCROSS_ARGS["pkgname"],
@@ -702,4 +798,9 @@ def compiler_main():
 
 
 if IS_COMPILER_INVOCATION:
-    compiler_main()
+    _cov = _coverage_start()
+    try:
+        compiler_main()
+    finally:
+        if _cov is not None:
+            _coverage_save(_cov)

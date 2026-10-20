@@ -1,6 +1,10 @@
 import dataclasses
+import importlib.util
+import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -59,6 +63,57 @@ class Args:
 class InstallOptions:
     compression_level: int
     metadata_files: bool
+
+
+PYWASMCROSS_COVERAGE_ENV_VAR = "PYWASMCROSS_COVERAGE_DIR"
+DEFAULT_COVERAGE_DIR = "pywasmcross-coverage"
+
+
+def coverage_options(f: Callable[..., Any]) -> Callable[..., Any]:
+    """Click options shared by build-recipes and build-recipes-no-deps."""
+    f = click.option(
+        "--coverage-dir",
+        default=None,
+        envvar=PYWASMCROSS_COVERAGE_ENV_VAR,
+        show_envvar=True,
+        help=(
+            "Where to write the pywasmcross coverage records. Implies --coverage. "
+            f"Default: ./{DEFAULT_COVERAGE_DIR}"
+        ),
+    )(f)
+    f = click.option(
+        "--coverage",
+        is_flag=True,
+        default=False,
+        help=(
+            "Record which lines of the pywasmcross compiler wrapper each package "
+            "build exercises, as one JSON record per compiler invocation in "
+            "<coverage-dir>/<package>.jsonl. Requires the 'coverage' package."
+        ),
+    )(f)
+    return f
+
+
+def enable_pywasmcross_coverage(coverage: bool, coverage_dir: str | None) -> None:
+    """
+    Turn on pywasmcross coverage recording for this process and all of its
+    children (the per-package build subprocesses, build scripts and compiler
+    wrapper invocations all inherit the environment).
+    """
+    if not coverage and not coverage_dir:
+        return
+    if importlib.util.find_spec("coverage") is None:
+        logger.error(
+            "--coverage requires the 'coverage' package to be installed in the "
+            "same environment as pyodide-build: pip install coverage"
+        )
+        sys.exit(1)
+    # The compiler wrapper runs with the package source tree as its cwd, so
+    # the path must be absolute.
+    resolved = Path(coverage_dir or DEFAULT_COVERAGE_DIR).resolve()
+    resolved.mkdir(parents=True, exist_ok=True)
+    os.environ[PYWASMCROSS_COVERAGE_ENV_VAR] = str(resolved)
+    logger.info("Recording pywasmcross coverage to %s", resolved)
 
 
 @click.command("build-recipes-no-deps")
@@ -138,6 +193,7 @@ class InstallOptions:
     show_envvar=True,
     help="Skip automatic installation of Emscripten if not found.",
 )
+@coverage_options
 def build_recipes_no_deps(
     packages: tuple[str, ...],
     recipe_dir: str | None,
@@ -152,6 +208,8 @@ def build_recipes_no_deps(
     skip_rust_setup: bool,
     clean: bool,
     skip_emscripten_install: bool,
+    coverage: bool,
+    coverage_dir: str | None,
 ) -> None:
     """Build packages using yaml recipes but don't try to resolve dependencies.
 
@@ -159,6 +217,7 @@ def build_recipes_no_deps(
     Arguments:
         PACKAGES: Packages to build, or ``*`` for all packages in recipe directory.
     """
+    enable_pywasmcross_coverage(coverage, coverage_dir)
     init_environment()
 
     if build_env.in_xbuildenv():
@@ -325,6 +384,7 @@ def build_recipes_no_deps_impl(
     show_envvar=True,
     help="Skip automatic installation of Emscripten if not found.",
 )
+@coverage_options
 def build_recipes(
     packages: tuple[str, ...],
     recipe_dir: str | None,
@@ -344,6 +404,8 @@ def build_recipes(
     compression_level: int,
     clean: bool,
     skip_emscripten_install: bool,
+    coverage: bool,
+    coverage_dir: str | None,
 ) -> None:
     """Build packages using yaml recipes.
 
@@ -367,6 +429,7 @@ def build_recipes(
             metadata_files=metadata_files, compression_level=compression_level
         )
 
+    enable_pywasmcross_coverage(coverage, coverage_dir)
     init_environment()
 
     if build_env.in_xbuildenv():
